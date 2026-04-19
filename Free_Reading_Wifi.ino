@@ -168,7 +168,28 @@ void buildLibraryIndex() {
     entry.close();
   }
 
-  root.close();
+    root.close();
+
+    // ─── SORT HERE ─────────────────────────────────────
+    std::sort(library.begin(), library.end(), [](const BookEntry &a, const BookEntry &b) {
+      return a.dirName < b.dirName;
+    });
+
+    // ─── BUILD CACHED HTML ─────────────────────────────
+    cachedLibraryHTML = pageStyle + "<title>Library</title></head><body>";
+    cachedLibraryHTML += "<a class='back' href='/'>← Home</a>";
+    cachedLibraryHTML += "<h2>📚 Library</h2><ul>";
+
+    for (auto &book : library) {
+      String href = "/sd/" + book.dirName + "/" + book.contentFile;
+
+      cachedLibraryHTML += "<li><a href='" + href + "'>" + book.title + "</a>";
+      if (!book.author.isEmpty())
+        cachedLibraryHTML += "<div class='meta'>by " + book.author + "</div>";
+      cachedLibraryHTML += "</li>";
+    }
+
+    cachedLibraryHTML += "</ul></body></html>";
 
   // Pre-render HTML
   cachedLibraryHTML = pageStyle + "<title>Library</title></head><body>";
