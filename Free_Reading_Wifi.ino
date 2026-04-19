@@ -1,5 +1,5 @@
 // Captive portal with SPIFFS + SD card file serving
-// Adapted from https://git.vvvvvvaria.org/then/ESP8266-captive-ota-spiffs
+// Now with precomputed SD index + cached HTML
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -10,6 +10,7 @@
 #include <FS.h>    // SPIFFS
 #include <SPI.h>
 #include <SD.h>
+#include <vector>
 
 DNSServer dnsServer;
 const byte DNS_PORT = 53;
@@ -26,6 +27,20 @@ const char* ssid = STASSID;
 const int SD_CS_PIN = D8;
 
 bool sdAvailable = false;
+
+// ─── Library Struct + Cache ────────────────────────────────────────────────
+
+struct BookEntry {
+  String dirName;
+  String title;
+  String author;
+  String contentFile;
+};
+
+std::vector<BookEntry> library;
+String cachedLibraryHTML;
+
+// ─── UI HTML ───────────────────────────────────────────────────────────────
 
 const String pageStyle =
   "<!DOCTYPE html><html><head>"
@@ -64,57 +79,31 @@ String responseHTML =
   "<h1>📚 The Library</h1>"
   "<p class='subtitle'>An offline, wireless reading room</p>"
   "<a class='browse-btn' href='/sd'>Browse the Library →</a>"
-  "<div class='card'>"
-  "<h3>What is this?</h3>"
-  "<p>You've connected to a small device hosting a collection of documents "
-  "and files. No internet connection is needed — everything is stored locally.</p>"
-  "</div>"
-  "<div class='card'>"
-  "<h3>How do I use it?</h3>"
-  "<p>Tap <b>Browse the Library</b> above to explore the available files. "
-  "PDFs and web pages will open directly in your browser.</p>"
-  "</div>"
-  "<div class='card'>"
-  "<h3>Do I need an app?</h3>"
-  "<p>No. This works entirely in your browser — nothing to install.</p>"
-  "</div>"
-  "<div class='card'>"
-  "<h3>Will this use my data?</h3>"
-  "<p>No. This device has no connection to the internet. "
-  "Your browsing here is completely local and private.</p>"
-  "</div>"
+  "<div class='card'><h3>What is this?</h3><p>Offline library.</p></div>"
   "</body></html>";
 
 
-// ─── Content Type ────────────────────────────────────────────────────────────
+// ─── Content Type ───────────────────────────────────────────────────────────
 
 String getContentType(String filename) {
   if (server.hasArg("download"))       return "application/octet-stream";
-  else if (filename.endsWith(".htm"))  return "text/html";
   else if (filename.endsWith(".html")) return "text/html";
   else if (filename.endsWith(".css"))  return "text/css";
   else if (filename.endsWith(".js"))   return "application/javascript";
   else if (filename.endsWith(".png"))  return "image/png";
-  else if (filename.endsWith(".gif"))  return "image/gif";
   else if (filename.endsWith(".jpg"))  return "image/jpeg";
-  else if (filename.endsWith(".ico"))  return "image/x-icon";
-  else if (filename.endsWith(".xml"))  return "text/xml";
-  else if (filename.endsWith(".mp4"))  return "video/mp4";
   else if (filename.endsWith(".pdf"))  return "application/pdf";
-  else if (filename.endsWith(".zip"))  return "application/x-zip";
-  else if (filename.endsWith(".gz"))   return "application/x-gzip";
   return "text/plain";
 }
 
 
-// ─── meta.txt Parser ─────────────────────────────────────────────────────────
+// ─── meta.txt reader ────────────────────────────────────────────────────────
 
-// Read a key from /dirName/meta.txt on the SD root
-// dirName is the raw 8.3 name e.g. "MOBYDI~1"
 String readMeta(String dirName, String key) {
   String path = "/" + dirName + "/meta.txt";
   File f = SD.open(path.c_str(), FILE_READ);
   if (!f) return "";
+
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
@@ -124,173 +113,147 @@ String readMeta(String dirName, String key) {
       return line.substring(sep + 1);
     }
   }
+
   f.close();
   return "";
 }
 
 
-// ─── SPIFFS File Serving ─────────────────────────────────────────────────────
+// ─── Build Library Index (NEW) ──────────────────────────────────────────────
 
-bool handleFileRead(String path) {
-  if (path.endsWith("/")) path += "index.html";
-  String contentType = getContentType(path);
-  String pathWithGz = path + ".gz";
-  if (SPIFFS.exists(pathWithGz) || SPIFFS.exists(path)) {
-    if (SPIFFS.exists(pathWithGz)) path += ".gz";
-    File file = SPIFFS.open(path, "r");
-    server.streamFile(file, contentType);
-    file.close();
-    return true;
-  }
-  return false;
-}
-
-
-// ─── SD Card Serving ─────────────────────────────────────────────────────────
-
-// Serve a file from the SD card using its exact path e.g. "/MOBYDI~1/book.pdf"
-bool handleSDFileRead(String sdPath) {
-  if (!sdAvailable) {
-    server.send(503, "text/plain", "SD card not available");
-    return false;
-  }
-
-  // Ensure single leading slash
-  while (sdPath.startsWith("//")) sdPath = sdPath.substring(1);
-  if (!sdPath.startsWith("/")) sdPath = "/" + sdPath;
-
-  File file = SD.open(sdPath.c_str(), FILE_READ);
-  if (!file || file.isDirectory()) {
-    server.send(404, "text/plain", "Could not open: [" + sdPath + "]");
-    file.close();
-    return false;
-  }
-
-  server.sendHeader("Content-Length", String(file.size()));
-  server.streamFile(file, getContentType(sdPath));
-  file.close();
-  return true;
-}
-
-// List all book directories on the SD root
-void handleSDList() {
-  if (!sdAvailable) {
-    server.send(503, "text/plain", "SD card not available");
-    return;
-  }
+void buildLibraryIndex() {
+  if (!sdAvailable) return;
 
   File root = SD.open("/");
-  if (!root || !root.isDirectory()) {
-    server.send(503, "text/plain", "SD card not readable");
-    return;
-  }
-
-  String output = pageStyle + "<title>Library</title></head><body>";
-  output += "<a class='back' href='/'>← Home</a>";
-  output += "<h2>📚 Library</h2>";
-  output += "<ul>";
+  if (!root || !root.isDirectory()) return;
 
   while (true) {
     File entry = root.openNextFile();
     if (!entry) break;
 
-    // Only process directories, skip loose files and hidden entries
-    if (!entry.isDirectory()) { entry.close(); continue; }
+    if (!entry.isDirectory()) {
+      entry.close();
+      continue;
+    }
 
     String dirName = String(entry.name());
     if (dirName.lastIndexOf('/') >= 0)
       dirName = dirName.substring(dirName.lastIndexOf('/') + 1);
-    if (dirName.startsWith(".")) { entry.close(); continue; }
 
-    // Read display info from meta.txt using the 8.3 dir name
-    String title  = readMeta(dirName, "title");
-    String author = readMeta(dirName, "author");
-    if (title.isEmpty()) title = dirName; // fallback to raw name
+    if (dirName.startsWith(".")) {
+      entry.close();
+      continue;
+    }
 
-    // Prefer book.pdf, fall back to book.htm
-    String contentFile = "";
+    BookEntry book;
+    book.dirName = dirName;
+    book.title  = readMeta(dirName, "title");
+    book.author = readMeta(dirName, "author");
+
+    if (book.title.isEmpty()) book.title = dirName;
+
     String pdfPath = "/" + dirName + "/book.pdf";
     String htmPath = "/" + dirName + "/book.htm";
-    if (SD.exists(pdfPath.c_str()))      contentFile = "book.pdf";
-    else if (SD.exists(htmPath.c_str())) contentFile = "book.htm";
 
-    if (contentFile.isEmpty()) { entry.close(); continue; } // skip if no content
+    if (SD.exists(pdfPath.c_str()))
+      book.contentFile = "book.pdf";
+    else if (SD.exists(htmPath.c_str()))
+      book.contentFile = "book.htm";
+    else {
+      entry.close();
+      continue;
+    }
 
-    String href = "/sd/" + dirName + "/" + contentFile;
-
-    output += "<li><a href='" + href + "'>" + title + "</a>";
-    if (!author.isEmpty())
-      output += "<div class='meta'>by " + author + "</div>";
-    output += "</li>";
-
+    library.push_back(book);
     entry.close();
   }
 
   root.close();
-  output += "</ul></body></html>";
-  server.send(200, "text/html", output);
+
+  // Pre-render HTML
+  cachedLibraryHTML = pageStyle + "<title>Library</title></head><body>";
+  cachedLibraryHTML += "<a class='back' href='/'>← Home</a>";
+  cachedLibraryHTML += "<h2>📚 Library</h2><ul>";
+
+  for (auto &book : library) {
+    String href = "/sd/" + book.dirName + "/" + book.contentFile;
+
+    cachedLibraryHTML += "<li><a href='" + href + "'>" + book.title + "</a>";
+    if (!book.author.isEmpty())
+      cachedLibraryHTML += "<div class='meta'>by " + book.author + "</div>";
+    cachedLibraryHTML += "</li>";
+  }
+
+  cachedLibraryHTML += "</ul></body></html>";
 }
 
 
-// ─── SD Routing ──────────────────────────────────────────────────────────────
+// ─── SD Handlers ────────────────────────────────────────────────────────────
+
+bool handleSDFileRead(String sdPath) {
+  if (!sdAvailable) {
+    server.send(503, "text/plain", "SD not available");
+    return false;
+  }
+
+  if (!sdPath.startsWith("/")) sdPath = "/" + sdPath;
+
+  File file = SD.open(sdPath.c_str(), FILE_READ);
+  if (!file || file.isDirectory()) {
+    server.send(404, "text/plain", "Not found");
+    return false;
+  }
+
+  server.streamFile(file, getContentType(sdPath));
+  file.close();
+  return true;
+}
 
 void handleSD() {
   String uri = server.uri();
 
   if (uri == "/sd" || uri == "/sd/") {
-    handleSDList();
+    server.send(200, "text/html", cachedLibraryHTML);
     return;
   }
 
-  // Strip "/sd" prefix → e.g. "/MOBYDI~1/book.pdf"
   String sdPath = uri.substring(3);
   handleSDFileRead(sdPath);
 }
 
 
-// ─── Setup ───────────────────────────────────────────────────────────────────
+// ─── Setup ──────────────────────────────────────────────────────────────────
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Booting");
 
-  Serial.print("Initializing SD card... ");
   if (SD.begin(SD_CS_PIN)) {
     sdAvailable = true;
-    Serial.println("SD card ready.");
-  } else {
-    Serial.println("SD card init failed — continuing without it.");
+    buildLibraryIndex();
+    Serial.printf("Indexed %d books\n", library.size());
   }
 
   WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
   WiFi.softAP(ssid);
-  dnsServer.start(DNS_PORT, "*", apIP);
 
-  MDNS.begin("esp8266", WiFi.softAPIP());
-  Serial.println("Ready");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.softAPIP());
+  dnsServer.start(DNS_PORT, "*", apIP);
 
   SPIFFS.begin();
 
   server.onNotFound([]() {
     String uri = server.uri();
-    if (uri.startsWith("/sd")) {
-      handleSD();
-    } else if (!handleFileRead(uri)) {
-      server.send(200, "text/html", responseHTML);
-    }
+    if (uri.startsWith("/sd")) handleSD();
+    else server.send(200, "text/html", responseHTML);
   });
 
   server.begin();
 }
 
 
-// ─── Loop ────────────────────────────────────────────────────────────────────
+// ─── Loop ───────────────────────────────────────────────────────────────────
 
 void loop() {
   dnsServer.processNextRequest();
   server.handleClient();
-  delay(50);
 }
