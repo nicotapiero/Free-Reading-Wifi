@@ -16,3 +16,4 @@ to help me bulk download from https://www.gutenberg.org/browse/scores/top#books-
 * Parsing has trouble when no author, often ID gets caught in the title
 * ESPAsyncWebServer might be able to provide some more parallelization to make it less slow
 * add bigger description to the site
+* Find a way to blink the LED when requests are made without blocking the request path
