@@ -87,7 +87,7 @@ String responseHTML =
 
 String getContentType(String filename) {
   if (server.hasArg("download"))       return "application/octet-stream";
-  else if (filename.endsWith(".html")) return "text/html";
+  else if (filename.endsWith(".html") || filename.endsWith(".htm")) return "text/html; charset=utf-8";
   else if (filename.endsWith(".css"))  return "text/css";
   else if (filename.endsWith(".js"))   return "application/javascript";
   else if (filename.endsWith(".png"))  return "image/png";
